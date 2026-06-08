@@ -1,72 +1,85 @@
-import { v4 as uuidv4 } from 'uuid'; // Si no usas uuid, puedes usar crypto.randomUUID() de Node nativo
+import crypto from 'node:crypto';
+import { crearCanalPasivo } from './dataChannel.js';
 
-// Mapa en memoria para rastrear a todos los clientes conectados actualmente
 const clientesConectados = new Map();
 
 export const manejarNuevaConexion = (socket) => {
-    // Generamos un ID único para esta sesión de cliente
     const clientId = crypto.randomUUID();
-    
-    console.log(`[CONEXIÓN] Nuevo cliente conectado desde ${socket.remoteAddress}:${socket.remotePort} (ID: ${clientId})`);
+    console.log(`[CONEXIÓN] Nuevo cliente (ID: ${clientId}) desde ${socket.remoteAddress}:${socket.remotePort}`);
 
-    // Creamos el objeto de estado inicial del cliente
     const estadoCliente = {
         id: clientId,
         socket: socket,
-        username: null,
         isAuthenticated: false,
-        isPassiveMode: false,
-        dataServer: null, // Guardará el mini-servidor temporal para el canal de datos
-        dataSocket: null  // Guardará el socket de datos una vez conectado
+        dataServer: null,
+        dataSocket: null
     };
 
-    // Guardamos al cliente en nuestro mapa de control activo
     clientesConectados.set(clientId, estadoCliente);
 
-    // Configuración inicial del socket
-    socket.setEncoding('utf-8'); // Para recibir strings y no Buffers crudos de bytes
-    socket.setKeepAlive(true, 60000); // Mantiene la conexión viva y detecta caídas de red
+    socket.setEncoding('utf-8');
+    socket.setKeepAlive(true, 60000);
 
-    // 1. SALUDO INICIAL: Según el protocolo FTP, el servidor DEBE hablar primero
+    // Saludo inicial
     socket.write("220 Servicio FTP de Josefo listo.\r\n");
 
-    // 2. ESCUCHA DE COMANDOS (Canal de Control)
-    socket.on('data', (data) => {
-        console.log(`[CLIENTE ${clientId}]: ${data.trim()}`);
-        
-        // AQUÍ ES DONDE EL INTEGRANTE 2 INTERCEPTARÁ EL TEXTO
-        // Por ahora, una respuesta temporal para que veas el eco
-        if (data.toUpperCase().startsWith('QUIT')) {
+    socket.on('data', async (data) => {
+        const comando = data.trim().toUpperCase();
+        console.log(`[CLIENTE Control]: ${comando}`);
+
+        // --- SIMULACIÓN DEL COMANDO PASV ---
+        if (comando.startsWith('PASV')) {
+            try {
+                // 1. Llamamos a tu función para abrir el puerto aleatorio
+                const { puerto, dataSocketPromise, server } = await crearCanalPasivo();
+                estadoCliente.dataServer = server;
+
+                console.log(`[SERVER] Canal de datos abierto esperando en el puerto: ${puerto}`);
+                
+                // 2. Le respondemos al cliente por el canal de CONTROL diciéndole a dónde conectarse
+                // Nota: Usamos un formato simple para la prueba: (IP,PUERTO)
+                socket.write(`227 Entering Passive Mode (127,0,0,1,${puerto})\r\n`);
+
+                // 3. Nos quedamos esperando a que el cliente se conecte a ese segundo tubo
+                const dataSocket = await dataSocketPromise;
+                estadoCliente.dataSocket = dataSocket;
+                console.log(`[SERVER-DATA] ¡El cliente se conectó físicamente al puerto de datos ${puerto}!`);
+
+                // 4. Simulamos un envío de datos (Aquí el Integrante 3 mandaría un archivo)
+                dataSocket.write("Contenido del archivo: ¡Felicidades, el canal de datos funciona!\r\n");
+                
+                // 5. El protocolo dicta que al terminar de transferir, se cierra el canal de datos
+                dataSocket.end(); 
+
+            } catch (err) {
+                console.error(`Error al crear canal pasivo: ${err.message}`);
+                socket.write("425 Can't open data connection.\r\n");
+            }
+        } 
+        // --- OTROS COMANDOS TEMPORALES ---
+        else if (comando.startsWith('QUIT')) {
             socket.write("221 Goodbye.\r\n");
             socket.end();
         } else {
-            // El Integrante 2 reemplazará esta línea con su procesador de comandos
-            socket.write("500 Comando no implementado aún en esta fase.\r\n");
+            socket.write("500 Comando no implementado aún.\r\n");
         }
     });
 
-    // 3. MANEJO DE CIERRE DE CONEXIÓN
     socket.on('close', () => {
-        console.log(`[DESCONEXIÓN] El cliente ${clientId} ha cerrado la sesión.`);
+        console.log(`[DESCONEXIÓN] Cliente ${clientId} desconectado.`);
         limpiarRecursosCliente(clientId);
     });
 
-    // 4. MANEJO DE ERRORES DEL SOCKET CLIENTE
     socket.on('error', (err) => {
-        console.error(`[SOCKET ERROR] Error en cliente ${clientId}: ${err.message}`);
-        // No hace falta llamar a socket.end(), el evento 'close' se disparará automáticamente
+        console.error(`[SOCKET ERROR]: ${err.message}`);
     });
-}
+};
 
-// Función auxiliar para evitar fugas de memoria si el cliente se cae abruptamente
 const limpiarRecursosCliente = (clientId) => {
     const cliente = clientesConectados.get(clientId);
     if (cliente) {
-        // Si dejó un servidor pasivo abierto, lo cerramos
         if (cliente.dataServer) cliente.dataServer.close();
         if (cliente.dataSocket) cliente.dataSocket.destroy();
-        
         clientesConectados.delete(clientId);
-        console.log(`[MEMORIA] Recursos liberados para el cliente ${clientId}. Total activos: ${clientesConectados.size}`);
     }
-}
+};

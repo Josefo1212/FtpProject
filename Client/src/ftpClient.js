@@ -1,4 +1,5 @@
 import net from 'node:net';
+import { conectarCanalDatos } from './dataHandler.js';
 
 class FtpClient {
     constructor(host = '127.0.0.1', port = 3000) {
@@ -9,75 +10,84 @@ class FtpClient {
 
     conectar() {
         return new Promise((resolve, reject) => {
-            // Creamos el socket de conexión hacia el canal de control del servidor
             this.controlSocket = net.createConnection({ host: this.host, port: this.port }, () => {
-                console.log(`[SISTEMA] Conectado físicamente al servidor ${this.host}:${this.port}`);
+                console.log(`[SISTEMA] Conectado al canal de control en ${this.host}:${this.port}`);
             });
 
             this.controlSocket.setEncoding('utf-8');
 
-            // ESCUCHA DE RESPUESTAS DEL SERVIDOR
-            this.controlSocket.on('data', (data) => {
-                // Imprime directamente lo que responde el servidor (ej: "220 Servicio listo")
-                console.log(`\n[SERVIDOR]: ${data.trim()}`);
+            this.controlSocket.on('data', async (data) => {
+                console.log(`[SERVIDOR Control]: ${data.trim()}`);
                 
-                // AQUÍ EL INTEGRANTE 2 INTERCEPTARÁ LOS CÓDIGOS (220, 230, etc.)
+                // Si es el saludo inicial, resolvemos la promesa
                 if (data.startsWith('220')) {
-                    resolve(true); // Conexión y saludo exitoso
+                    resolve(true);
+                }
+
+                // --- SI EL SERVIDOR RESPONDE QUE ENTRÓ EN MODO PASIVO ---
+                if (data.startsWith('227')) {
+                    // Extraemos el puerto usando una expresión regular sencilla
+                    const matches = data.match(/127,0,0,1,(\d+)/);
+                    if (matches) {
+                        const puertoDatos = parseInt(matches[1], 10);
+                        
+                        // ¡Llamamos a tu función para conectar el segundo tubo!
+                        const dataSocket = await conectarCanalDatos(this.host, puertoDatos);
+                        
+                        // Nos quedamos escuchando lo que venga por el tubo de DATOS
+                        dataSocket.on('data', (dataBytes) => {
+                            console.log(`\n[SERVIDOR Datos Devuelve]:\n--> ${dataBytes.toString().trim()}`);
+                        });
+
+                        dataSocket.on('close', () => {
+                            console.log("[DATA] Canal de datos cerrado por el servidor de forma limpia.");
+                        });
+                    }
                 }
             });
 
-            // MANEJO DE CIERRE
             this.controlSocket.on('close', () => {
-                console.log('\n[SISTEMA] Conexión con el servidor finalizada.');
+                console.log('[SISTEMA] Conexión de control finalizada.');
                 process.exit(0);
             });
 
-            // MANEJO DE ERRORES DE CONEXIÓN INICIAL
             this.controlSocket.on('error', (err) => {
-                console.error(`[ERROR CLIENTE] No se pudo conectar: ${err.message}`);
                 reject(err);
             });
         });
     }
 
-    /**
-     * Envía un comando formateado bajo el estándar FTP (\r\n al final)
-     * @param {string} comando - El comando plano (ej: "USER anonimo")
-     */
     enviarComando(comando) {
-        if (!this.controlSocket || this.controlSocket.destroyed) {
-            console.error('[ERROR] No hay una conexión activa con el servidor.');
-            return;
+        if (this.controlSocket && !this.controlSocket.destroyed) {
+            this.controlSocket.write(`${comando.trim()}\r\n`);
         }
-        // El protocolo FTP exige imperativamente terminar cada línea con Carriage Return y Line Feed
-        this.controlSocket.write(`${comando.trim()}\r\n`);
     }
 }
 
 // =================================================================
-// EJECUCIÓN DE PRUEBA (Para validar tu Hito 1)
+// FLUJO DE LA PRUEBA FINAL
 // =================================================================
 const cliente = new FtpClient('127.0.0.1', 3000);
 
-async function iniciarPrueba() {
+async function iniciar() {
     try {
         await cliente.conectar();
         
-        // Simulamos que el usuario escribe comandos en la consola tras recibir el saludo
+        // A los 2 segundos, el cliente solicita entrar en Modo Pasivo
         setTimeout(() => {
-            console.log("[TEST] Enviando comando de prueba USER...");
-            cliente.enviarComando("USER josefo");
-        }, 1500);
+            console.log("\n[TEST] Solicitando Modo Pasivo (PASV)...");
+            cliente.enviarComando("PASV");
+        }, 2000);
 
+        // A los 6 segundos, cerramos la app de forma ordenada
         setTimeout(() => {
-            console.log("[TEST] Cerrando sesión con QUIT...");
+            console.log("\n[TEST] Terminando simulación...");
             cliente.enviarComando("QUIT");
-        }, 4000);
+        }, 6000);
 
-    } catch (error) {
-        console.error("Fallo la inicialización del cliente de prueba.");
+    } catch (err) {
+        console.error("Error en la ejecución:", err.message);
     }
 }
 
-iniciarPrueba();
+iniciar();

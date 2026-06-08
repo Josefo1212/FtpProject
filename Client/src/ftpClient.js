@@ -1,93 +1,376 @@
 import net from 'node:net';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parseFTPResponse, parsePASVResponse } from './ftpProtocol.js';
 import { conectarCanalDatos } from './dataHandler.js';
 
-class FtpClient {
+/**
+ * Cliente FTP completo que implementa la lógica de red de control y de datos
+ * utilizando una cola de solicitudes basadas en Promesas.
+ */
+export class FtpClient {
+    /**
+     * @param {string} host - Servidor FTP IP o Dominio.
+     * @param {number} port - Puerto de control del servidor FTP.
+     */
     constructor(host = '127.0.0.1', port = 3000) {
         this.host = host;
         this.port = port;
         this.controlSocket = null;
+        
+        // Cola para sincronizar comandos síncronos sobre canal asíncrono TCP
+        this.pendingRequests = [];
+        this.currentResponseLines = [];
+        
+        this.connectResolver = null;
+        this.connectRejecter = null;
     }
 
+    /**
+     * Conecta al puerto de control del servidor FTP y espera el saludo '220'.
+     * @returns {Promise<{code: number, message: string}>}
+     */
     conectar() {
         return new Promise((resolve, reject) => {
+            this.connectResolver = resolve;
+            this.connectRejecter = reject;
+
             this.controlSocket = net.createConnection({ host: this.host, port: this.port }, () => {
-                console.log(`[SISTEMA] Conectado al canal de control en ${this.host}:${this.port}`);
+                console.log(`[SISTEMA] Canal de control TCP conectado a ${this.host}:${this.port}`);
             });
 
             this.controlSocket.setEncoding('utf-8');
 
-            this.controlSocket.on('data', async (data) => {
-                console.log(`[SERVIDOR Control]: ${data.trim()}`);
+            let buffer = '';
+            this.controlSocket.on('data', (chunk) => {
+                buffer += chunk;
+                let newlineIndex;
                 
-                // Si es el saludo inicial, resolvemos la promesa
-                if (data.startsWith('220')) {
-                    resolve(true);
-                }
-
-                // --- SI EL SERVIDOR RESPONDE QUE ENTRÓ EN MODO PASIVO ---
-                if (data.startsWith('227')) {
-                    // Extraemos el puerto usando una expresión regular sencilla
-                    const matches = data.match(/127,0,0,1,(\d+)/);
-                    if (matches) {
-                        const puertoDatos = parseInt(matches[1], 10);
-                        
-                        // ¡Llamamos a tu función para conectar el segundo tubo!
-                        const dataSocket = await conectarCanalDatos(this.host, puertoDatos);
-                        
-                        // Nos quedamos escuchando lo que venga por el tubo de DATOS
-                        dataSocket.on('data', (dataBytes) => {
-                            console.log(`\n[SERVIDOR Datos Devuelve]:\n--> ${dataBytes.toString().trim()}`);
-                        });
-
-                        dataSocket.on('close', () => {
-                            console.log("[DATA] Canal de datos cerrado por el servidor de forma limpia.");
-                        });
-                    }
+                // Procesar línea por línea
+                while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+                    const line = buffer.substring(0, newlineIndex);
+                    buffer = buffer.substring(newlineIndex + 1);
+                    this._procesarLineaControl(line);
                 }
             });
 
             this.controlSocket.on('close', () => {
                 console.log('[SISTEMA] Conexión de control finalizada.');
-                process.exit(0);
+                this._rechazarTodo(new Error('La conexión de control se cerró de forma inesperada.'));
             });
 
             this.controlSocket.on('error', (err) => {
-                reject(err);
+                console.error(`[CONTROL ERROR] Fallo en la comunicación: ${err.message}`);
+                if (this.connectRejecter) {
+                    this.connectRejecter(err);
+                    this.connectResolver = null;
+                    this.connectRejecter = null;
+                }
+                this._rechazarTodo(err);
             });
         });
     }
 
+    /**
+     * Envía un comando de texto plano formateado con \r\n al servidor
+     * y encola una promesa para capturar su respuesta numérica.
+     * 
+     * @param {string} comando - Comando FTP completo (ej: "USER laura").
+     * @returns {Promise<{code: number, message: string, raw: string}>}
+     */
     enviarComando(comando) {
-        if (this.controlSocket && !this.controlSocket.destroyed) {
-            this.controlSocket.write(`${comando.trim()}\r\n`);
+        return new Promise((resolve, reject) => {
+            if (!this.controlSocket || this.controlSocket.destroyed) {
+                return reject(new Error("No hay conexión de control establecida."));
+            }
+
+            const cleanCmd = comando.trim();
+            // Encolamos el resolver para responder de forma ordenada (FIFO)
+            this.pendingRequests.push({ resolve, reject, command: cleanCmd });
+            
+            // Envío en formato estándar de protocolo de internet FTP (\r\n)
+            this.controlSocket.write(`${cleanCmd}\r\n`);
+        });
+    }
+
+    /**
+     * Procesa líneas de control entrantes y une tramas multilíneas si es necesario.
+     * 
+     * @param {string} line - Línea cruda sin el salto final de carro.
+     */
+    _procesarLineaControl(line) {
+        if (line.trim() === '') return;
+
+        const parsed = parseFTPResponse(line);
+
+        // Si ya estamos acumulando una respuesta multilínea
+        if (this.currentResponseLines.length > 0) {
+            this.currentResponseLines.push(parsed);
+
+            // El final de una respuesta multilínea debe empezar con el mismo código numérico y espacio
+            const startCode = this.currentResponseLines[0].code;
+            if (parsed.code === startCode && parsed.separator === ' ') {
+                const combinedMessage = this.currentResponseLines.map(r => r.message).join('\n');
+                const combinedRaw = this.currentResponseLines.map(r => r.raw).join('\n');
+                
+                const finalResponse = {
+                    code: startCode,
+                    message: combinedMessage,
+                    raw: combinedRaw
+                };
+                
+                this.currentResponseLines = [];
+                this._despacharRespuesta(finalResponse);
+            }
+        } else {
+            // Si inicia una respuesta multilínea
+            if (parsed.separator === '-') {
+                this.currentResponseLines.push(parsed);
+            } else {
+                // Respuesta de una sola línea
+                this._despacharRespuesta(parsed);
+            }
+        }
+    }
+
+    /**
+     * Resuelve la promesa correspondiente en la cola o el handshake inicial.
+     */
+    _despacharRespuesta(response) {
+        // Caso especial: El mensaje 220 inicial (Handshake de conexión)
+        if (this.connectResolver && response.code === 220) {
+            this.connectResolver(response);
+            this.connectResolver = null;
+            this.connectRejecter = null;
+            return;
+        }
+
+        // Obtener la promesa más antigua en espera
+        if (this.pendingRequests.length > 0) {
+            const req = this.pendingRequests.shift();
+            req.resolve(response);
+        }
+    }
+
+    _rechazarTodo(error) {
+        while (this.pendingRequests.length > 0) {
+            const req = this.pendingRequests.shift();
+            req.reject(error);
+        }
+    }
+
+    // ==========================================
+    // MÉTODOS DE ALTO NIVEL (LÓGICA DE NEGOCIO)
+    // ==========================================
+
+    async login(user, pass) {
+        const resUser = await this.enviarComando(`USER ${user}`);
+        if (resUser.code === 331) {
+            const resPass = await this.enviarComando(`PASS ${pass}`);
+            return resPass.code === 230;
+        }
+        return resUser.code === 230;
+    }
+
+    async pwd() {
+        const res = await this.enviarComando("PWD");
+        if (res.code === 257) {
+            // Extraer la ruta entre comillas ej: 257 "/storage" is current directory.
+            const match = res.message.match(/"([^"]+)"/);
+            return match ? match[1] : res.message;
+        }
+        throw new Error(`Error en PWD: ${res.code} ${res.message}`);
+    }
+
+    async cwd(pathDir) {
+        const res = await this.enviarComando(`CWD ${pathDir}`);
+        return res.code === 250;
+    }
+
+    async cdup() {
+        const res = await this.enviarComando("CDUP");
+        return res.code === 250;
+    }
+
+    async type(mode) {
+        const res = await this.enviarComando(`TYPE ${mode}`);
+        return res.code === 200;
+    }
+
+    async pasv() {
+        const res = await this.enviarComando("PASV");
+        if (res.code === 227) {
+            return parsePASVResponse(res.message);
+        }
+        throw new Error(`Error en PASV: ${res.code} ${res.message}`);
+    }
+
+    async list(pathDir = '') {
+        const { host, port } = await this.pasv();
+        const dataSocketPromise = conectarCanalDatos(host, port);
+        const listCmdPromise = this.enviarComando(`LIST ${pathDir}`);
+        
+        const dataSocket = await dataSocketPromise;
+        
+        return new Promise((resolve, reject) => {
+            let dataBuffer = '';
+            dataSocket.setEncoding('utf-8');
+            
+            dataSocket.on('data', (chunk) => {
+                dataBuffer += chunk;
+            });
+            
+            dataSocket.on('error', (err) => {
+                reject(err);
+            });
+            
+            dataSocket.on('close', async () => {
+                try {
+                    const controlRes = await listCmdPromise;
+                    if (controlRes.code === 226 || controlRes.code === 250 || controlRes.code === 150) {
+                        resolve(dataBuffer);
+                    } else {
+                        reject(new Error(`Fallo en el listado de archivos: ${controlRes.code}`));
+                    }
+                } catch (err) {
+                    reject(err);
+                }
+            });
+        });
+    }
+
+    async download(remoteFile, localPath) {
+        const { host, port } = await this.pasv();
+        const dataSocketPromise = conectarCanalDatos(host, port);
+        const retrCmdPromise = this.enviarComando(`RETR ${remoteFile}`);
+        
+        const dataSocket = await dataSocketPromise;
+        
+        return new Promise((resolve, reject) => {
+            const writeStream = fs.createWriteStream(localPath);
+            
+            writeStream.on('error', (err) => {
+                reject(err);
+            });
+            
+            dataSocket.on('error', (err) => {
+                writeStream.destroy();
+                reject(err);
+            });
+            
+            dataSocket.pipe(writeStream);
+            
+            dataSocket.on('close', async () => {
+                try {
+                    const controlRes = await retrCmdPromise;
+                    // Puede responder 226 después de cerrar el socket de datos
+                    if (controlRes.code === 226 || controlRes.code === 250) {
+                        resolve(true);
+                    } else {
+                        reject(new Error(`Fallo al descargar archivo: ${controlRes.code}`));
+                    }
+                } catch (err) {
+                    reject(err);
+                }
+            });
+        });
+    }
+
+    async upload(localPath, remoteFile) {
+        if (!fs.existsSync(localPath)) {
+            throw new Error(`El archivo local no existe: ${localPath}`);
+        }
+        
+        const { host, port } = await this.pasv();
+        const dataSocketPromise = conectarCanalDatos(host, port);
+        const storCmdPromise = this.enviarComando(`STOR ${remoteFile}`);
+        
+        const dataSocket = await dataSocketPromise;
+        
+        return new Promise((resolve, reject) => {
+            const readStream = fs.createReadStream(localPath);
+            
+            readStream.on('error', (err) => {
+                reject(err);
+            });
+            
+            dataSocket.on('error', (err) => {
+                readStream.destroy();
+                reject(err);
+            });
+            
+            readStream.pipe(dataSocket);
+            
+            readStream.on('end', () => {
+                dataSocket.end(async () => {
+                    try {
+                        const controlRes = await storCmdPromise;
+                        if (controlRes.code === 226 || controlRes.code === 250) {
+                            resolve(true);
+                        } else {
+                            reject(new Error(`Fallo al subir archivo: ${controlRes.code}`));
+                        }
+                    } catch (err) {
+                        reject(err);
+                    }
+                });
+            });
+        });
+    }
+
+    async delete(remoteFile) {
+        const res = await this.enviarComando(`DELE ${remoteFile}`);
+        return res.code === 250;
+    }
+
+    async mkd(remoteDir) {
+        const res = await this.enviarComando(`MKD ${remoteDir}`);
+        return res.code === 257 || res.code === 250;
+    }
+
+    async rmd(remoteDir) {
+        const res = await this.enviarComando(`RMD ${remoteDir}`);
+        return res.code === 250;
+    }
+
+    async quit() {
+        try {
+            await this.enviarComando("QUIT");
+        } catch (e) {
+            // Ignorar errores si el servidor ya cerró la conexión
+        } finally {
+            if (this.controlSocket) {
+                this.controlSocket.destroy();
+            }
         }
     }
 }
 
-// =================================================================
-// FLUJO DE LA PRUEBA FINAL
-// =================================================================
-const cliente = new FtpClient('127.0.0.1', 3000);
-
-async function iniciar() {
-    try {
-        await cliente.conectar();
-        
-        // A los 2 segundos, el cliente solicita entrar en Modo Pasivo
-        setTimeout(() => {
-            console.log("\n[TEST] Solicitando Modo Pasivo (PASV)...");
-            cliente.enviarComando("PASV");
-        }, 2000);
-
-        // A los 6 segundos, cerramos la app de forma ordenada
-        setTimeout(() => {
-            console.log("\n[TEST] Terminando simulación...");
-            cliente.enviarComando("QUIT");
-        }, 6000);
-
-    } catch (err) {
-        console.error("Error en la ejecución:", err.message);
-    }
+// Ejecutar prueba automática si es el script principal
+const __filename = fileURLToPath(import.meta.url);
+if (process.argv[1] === __filename) {
+    const cliente = new FtpClient('127.0.0.1', 3000);
+    
+    (async () => {
+        try {
+            console.log("[TEST AUTOMÁTICO] Iniciando secuencia de prueba...");
+            await cliente.conectar();
+            
+            const loginOk = await cliente.login("laura", "12345");
+            console.log(`[TEST AUTOMÁTICO] Login exitoso: ${loginOk}`);
+            
+            const currentDir = await cliente.pwd();
+            console.log(`[TEST AUTOMÁTICO] Directorio actual: ${currentDir}`);
+            
+            console.log("[TEST AUTOMÁTICO] Solicitando LIST...");
+            const listData = await cliente.list();
+            console.log(`[TEST AUTOMÁTICO] Lista recibida:\n${listData}`);
+            
+            console.log("[TEST AUTOMÁTICO] Finalizando sesión...");
+            await cliente.quit();
+        } catch (err) {
+            console.error("[TEST AUTOMÁTICO ERROR]:", err.message);
+        }
+    })();
 }
-
-iniciar();

@@ -1,17 +1,30 @@
 import crypto from 'node:crypto';
-import { crearCanalPasivo } from './dataChannel.js';
+import { parseFTPLine } from './ftpProtocol.js';
+import { ejecutarComandoFTP } from './commands.js';
 
 const clientesConectados = new Map();
 
+/**
+ * Gestiona una nueva conexión en el canal de control.
+ * Implementa line-buffering para evitar problemas de fragmentación de red (TCP segment split).
+ * 
+ * @param {import('node:net').Socket} socket - El socket del canal de control.
+ */
 export const manejarNuevaConexion = (socket) => {
     const clientId = crypto.randomUUID();
-    console.log(`[CONEXIÓN] Nuevo cliente (ID: ${clientId}) desde ${socket.remoteAddress}:${socket.remotePort}`);
+    console.log(`[CONEXIÓN] Nuevo cliente conectado (ID: ${clientId}) desde ${socket.remoteAddress}:${socket.remotePort}`);
 
+    // Inicializamos el estado del cliente según el protocolo FTP
     const estadoCliente = {
         id: clientId,
         socket: socket,
         isAuthenticated: false,
+        state: 'NOT_LOGGED_IN',
+        username: null,
+        cwd: '/',
+        representationType: 'I', // Por defecto Binario ('I')
         dataServer: null,
+        dataSocketPromise: null,
         dataSocket: null
     };
 
@@ -20,66 +33,66 @@ export const manejarNuevaConexion = (socket) => {
     socket.setEncoding('utf-8');
     socket.setKeepAlive(true, 60000);
 
-    // Saludo inicial
-    socket.write("220 Servicio FTP de Josefo listo.\r\n");
+    // Mensaje de bienvenida estándar (Código 220)
+    socket.write("220 Servicio FTP de Josefo y Laura listo.\r\n");
 
-    socket.on('data', async (data) => {
-        const comando = data.trim().toUpperCase();
-        console.log(`[CLIENTE Control]: ${comando}`);
+    // Buffer para reconstruir líneas completas (\r\n)
+    let buffer = '';
 
-        // --- SIMULACIÓN DEL COMANDO PASV ---
-        if (comando.startsWith('PASV')) {
+    socket.on('data', async (chunk) => {
+        buffer += chunk;
+        let newlineIndex;
+        
+        // Mientras haya saltos de línea, extraemos y procesamos comandos
+        while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+            const line = buffer.substring(0, newlineIndex);
+            buffer = buffer.substring(newlineIndex + 1);
+            
+            // Omitir líneas vacías (ej: ping de red, etc.)
+            if (line.trim() === '') continue;
+
+            const { command, arg } = parseFTPLine(line);
+            console.log(`[CLIENTE Control - ID: ${clientId.substring(0, 8)}]: CMD=${command} ARG="${arg}"`);
+
             try {
-                // 1. Llamamos a tu función para abrir el puerto aleatorio
-                const { puerto, dataSocketPromise, server } = await crearCanalPasivo();
-                estadoCliente.dataServer = server;
-
-                console.log(`[SERVER] Canal de datos abierto esperando en el puerto: ${puerto}`);
-                
-                // 2. Le respondemos al cliente por el canal de CONTROL diciéndole a dónde conectarse
-                // Nota: Usamos un formato simple para la prueba: (IP,PUERTO)
-                socket.write(`227 Entering Passive Mode (127,0,0,1,${puerto})\r\n`);
-
-                // 3. Nos quedamos esperando a que el cliente se conecte a ese segundo tubo
-                const dataSocket = await dataSocketPromise;
-                estadoCliente.dataSocket = dataSocket;
-                console.log(`[SERVER-DATA] ¡El cliente se conectó físicamente al puerto de datos ${puerto}!`);
-
-                // 4. Simulamos un envío de datos (Aquí el Integrante 3 mandaría un archivo)
-                dataSocket.write("Contenido del archivo: ¡Felicidades, el canal de datos funciona!\r\n");
-                
-                // 5. El protocolo dicta que al terminar de transferir, se cierra el canal de datos
-                dataSocket.end(); 
-
+                await ejecutarComandoFTP(estadoCliente, command, arg);
             } catch (err) {
-                console.error(`Error al crear canal pasivo: ${err.message}`);
-                socket.write("425 Can't open data connection.\r\n");
+                console.error(`[ERROR EXEC] Error al ejecutar comando "${command}":`, err.message);
+                if (!socket.destroyed) {
+                    socket.write("550 Error interno al procesar el comando.\r\n");
+                }
             }
-        } 
-        // --- OTROS COMANDOS TEMPORALES ---
-        else if (comando.startsWith('QUIT')) {
-            socket.write("221 Goodbye.\r\n");
-            socket.end();
-        } else {
-            socket.write("500 Comando no implementado aún.\r\n");
         }
     });
 
     socket.on('close', () => {
-        console.log(`[DESCONEXIÓN] Cliente ${clientId} desconectado.`);
+        console.log(`[DESCONEXIÓN] Cliente ${clientId.substring(0, 8)} desconectado.`);
         limpiarRecursosCliente(clientId);
     });
 
     socket.on('error', (err) => {
-        console.error(`[SOCKET ERROR]: ${err.message}`);
+        console.error(`[SOCKET ERROR - ID: ${clientId.substring(0, 8)}]: ${err.message}`);
     });
 };
 
+/**
+ * Libera y destruye los puertos y sockets asociados al cliente al desconectarse.
+ * 
+ * @param {string} clientId - ID único de la conexión.
+ */
 const limpiarRecursosCliente = (clientId) => {
     const cliente = clientesConectados.get(clientId);
     if (cliente) {
-        if (cliente.dataServer) cliente.dataServer.close();
-        if (cliente.dataSocket) cliente.dataSocket.destroy();
+        try {
+            if (cliente.dataSocket) {
+                cliente.dataSocket.destroy();
+            }
+            if (cliente.dataServer) {
+                cliente.dataServer.close();
+            }
+        } catch (err) {
+            console.error(`Error al limpiar recursos del cliente ${clientId.substring(0, 8)}:`, err.message);
+        }
         clientesConectados.delete(clientId);
     }
 };

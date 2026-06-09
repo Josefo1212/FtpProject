@@ -211,20 +211,22 @@ export class FtpClient {
 
 
     async download(remoteFile, localPath) {
-        // Asegurar la carpeta de destino
-        const carpeta = path.dirname(localPath);
-        if (!fs.existsSync(carpeta)) {
-            fs.mkdirSync(carpeta, { recursive: true });
-        }
+    const pasvRes = await this.enviarComando("PASV");
+    const { host, port } = parsePASVResponse(pasvRes.message);
+    const dataSocket = await conectarCanalDatos(host, port);
 
-        const { host, port } = await this.pasv();
-        const dataSocket = await conectarCanalDatos(host, port);
-
-        // Enviar RETR: FileZilla responde 150 (ignorado) luego 226
+    return new Promise((resolve, reject) => {
         const retrPromise = this.enviarComando(`RETR ${remoteFile}`);
 
-        return new Promise((resolve, reject) => {
+        retrPromise.then((res) => {
+            if (res.code >= 400) {
+                dataSocket.destroy();
+                return reject(new Error(`Servidor rechazó la descarga: ${res.code} ${res.message}`));
+            }
+
+            // Crear el archivo real solo porque el servidor dijo que sí existe
             const writeStream = fs.createWriteStream(localPath);
+            dataSocket.pipe(writeStream);
 
             writeStream.on('error', (err) => {
                 dataSocket.destroy();
@@ -236,24 +238,22 @@ export class FtpClient {
                 reject(err);
             });
 
-            // Transferencia directa: socket de datos → archivo local
-            dataSocket.pipe(writeStream);
-
-            dataSocket.on('close', async () => {
-                try {
-                    const res = await retrPromise;
-                    if (res.code === 226 || res.code === 250) {
-                        resolve(true);
-                    } else {
-                        reject(new Error(`Error al descargar archivo: ${res.code} ${res.message}`));
-                    }
-                } catch (err) {
-                    reject(err);
-                }
+            // ✨ ESTE EVENTO ES EL CLAVE: Cuando el archivo se termina de escribir en disco
+            writeStream.on('finish', () => {
+                resolve(true); // <--- Esto despierta al 'await' en main.js
             });
-        });
-    }
 
+            // Por si el socket se cierra antes o después
+            dataSocket.on('close', () => {
+                resolve(true); 
+            });
+
+        }).catch((err) => {
+            dataSocket.destroy();
+            reject(err);
+        });
+    });
+}
     async upload(remoteFile, localPath) {
         if (!fs.existsSync(localPath)) {
             throw new Error(`Archivo local no encontrado: ${localPath}`);

@@ -345,6 +345,93 @@ export class FtpClient {
             }
         }
     }
+
+    /**
+     * Descarga un archivo del servidor y lo guarda en la carpeta local downloads/
+     */
+    async get(remoteFile, localFileName) {
+        const nombreLocal = localFileName || path.basename(remoteFile);
+        const rutaLocal = path.resolve('./downloads', nombreLocal);
+
+        // Asegurar la existencia de la carpeta downloads/
+        const carpetaDownloads = path.dirname(rutaLocal);
+        if (!fs.existsSync(carpetaDownloads)) {
+            fs.mkdirSync(carpetaDownloads, { recursive: true });
+        }
+
+        // 1. Solicitar el modo pasivo
+        const pasvRes = await this.enviarComando("PASV");
+        if (pasvRes.code !== 227) {
+            throw new Error(`No se pudo inicializar el modo pasivo: ${pasvRes.message}`);
+        }
+
+        // 2. Extraer el host y el puerto usando la función de Laura
+        const { host, port } = parsePASVResponse(pasvRes.message);
+
+        // 3. Conectar al socket de datos mediante la infraestructura de José
+        const dataSocket = await conectarCanalDatos(host, port);
+
+        // 4. Solicitar la descarga del archivo de control
+        const retrRes = await this.enviarComando(`RETR ${remoteFile}`);
+        if (retrRes.code !== 150 && retrRes.code !== 125) {
+            dataSocket.destroy();
+            throw new Error(`El servidor rechazó la descarga: ${retrRes.message}`);
+        }
+
+        // 5. Canalizar el stream de red hacia el archivo en disco
+        const writeStream = fs.createWriteStream(rutaLocal);
+        dataSocket.pipe(writeStream);
+
+        return new Promise((resolve, reject) => {
+            dataSocket.on('end', () => resolve(`Archivo descargado con éxito en: ${rutaLocal}`));
+            dataSocket.on('error', (err) => reject(err));
+            writeStream.on('error', (err) => reject(err));
+        });
+    }
+
+    /**
+     * Lee un archivo de la carpeta local downloads/ y lo sube al servidor
+     */
+    async put(localFile, remoteFileName) {
+        const rutaLocal = path.resolve('./downloads', localFile);
+        if (!fs.existsSync(rutaLocal)) {
+            throw new Error(`El archivo '${localFile}' no existe en la carpeta local 'downloads/'`);
+        }
+
+        const nombreRemoto = remoteFileName || path.basename(localFile);
+
+        // 1. Solicitar el modo pasivo
+        const pasvRes = await this.enviarComando("PASV");
+        if (pasvRes.code !== 227) {
+            throw new Error(`No se pudo inicializar el modo pasivo: ${pasvRes.message}`);
+        }
+
+        // 2. Resolver host y puerto
+        const { host, port } = parsePASVResponse(pasvRes.message);
+
+        // 3. Conectar canal de datos (José)
+        const dataSocket = await conectarCanalDatos(host, port);
+
+        // 4. Enviar comando STOR
+        const storRes = await this.enviarComando(`STOR ${nombreRemoto}`);
+        if (storRes.code !== 150 && storRes.code !== 125) {
+            dataSocket.destroy();
+            throw new Error(`El servidor rechazó la subida: ${storRes.message}`);
+        }
+
+        // 5. Canalizar el stream de lectura de disco hacia la red
+        const readStream = fs.createReadStream(rutaLocal);
+        readStream.pipe(dataSocket);
+
+        return new Promise((resolve, reject) => {
+            readStream.on('end', () => {
+                dataSocket.end();
+                resolve(`Archivo '${localFile}' subido exitosamente como '${nombreRemoto}'`);
+            });
+            readStream.on('error', (err) => reject(err));
+            dataSocket.on('error', (err) => reject(err));
+        });
+    }
 }
 
 // Ejecutar prueba automática si es el script principal
@@ -373,4 +460,6 @@ if (process.argv[1] === __filename) {
             console.error("[TEST AUTOMÁTICO ERROR]:", err.message);
         }
     })();
+
+    
 }

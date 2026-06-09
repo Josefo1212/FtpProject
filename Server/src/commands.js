@@ -225,149 +225,6 @@ const comandos = {
         }
     },
     
-    LIST: async (estadoCliente, arg) => {
-        const socket = estadoCliente.socket;
-        let dataSocket;
-        try {
-            dataSocket = await obtenerDataSocket(estadoCliente);
-        } catch (err) {
-            socket.write("425 Use PASV first.\r\n");
-            return;
-        }
-        
-        const { rutaFisica } = resolverRutaSegura(estadoCliente.cwd, arg || '.');
-        
-        try {
-            socket.write("150 Opening ASCII mode data connection for file list.\r\n");
-            
-            const entries = await fs.promises.readdir(rutaFisica, { withFileTypes: true });
-            const lines = [];
-            for (const entry of entries) {
-                const filePath = path.join(rutaFisica, entry.name);
-                try {
-                    const stats = await fs.promises.stat(filePath);
-                    lines.push(formatearFicheroLista(entry.name, stats));
-                } catch (statErr) {
-                    // Ignorar archivos que no se puedan leer
-                }
-            }
-            
-            const listData = lines.join('\r\n') + (lines.length > 0 ? '\r\n' : '');
-            dataSocket.write(listData, 'utf-8', () => {
-                finalizarTransferencia(estadoCliente);
-                socket.write("226 Directory send OK.\r\n");
-            });
-        } catch (err) {
-            console.error("Error en LIST:", err);
-            socket.write("550 Can't list directory.\r\n");
-            finalizarTransferencia(estadoCliente);
-        }
-    },
-    
-    RETR: async (estadoCliente, arg) => {
-        const socket = estadoCliente.socket;
-        if (!arg) {
-            socket.write("501 Syntax error in parameters.\r\n");
-            return;
-        }
-        
-        let dataSocket;
-        try {
-            dataSocket = await obtenerDataSocket(estadoCliente);
-        } catch (err) {
-            socket.write("425 Use PASV first.\r\n");
-            return;
-        }
-        
-        const { rutaFisica } = resolverRutaSegura(estadoCliente.cwd, arg);
-        
-        try {
-            const stats = await fs.promises.stat(rutaFisica);
-            if (!stats.isFile()) {
-                socket.write("550 Not a regular file.\r\n");
-                finalizarTransferencia(estadoCliente);
-                return;
-            }
-            
-            socket.write(`150 Opening BINARY mode data connection for ${arg} (${stats.size} bytes).\r\n`);
-            
-            const readStream = fs.createReadStream(rutaFisica);
-            
-            readStream.on('error', (err) => {
-                console.error("Error en lectura para RETR:", err);
-                socket.write("551 Error reading file.\r\n");
-                finalizarTransferencia(estadoCliente);
-            });
-            
-            dataSocket.on('error', (err) => {
-                console.error("Error en dataSocket en RETR:", err);
-                readStream.destroy();
-                finalizarTransferencia(estadoCliente);
-            });
-            
-            readStream.pipe(dataSocket);
-            
-            readStream.on('end', () => {
-                dataSocket.end(() => {
-                    finalizarTransferencia(estadoCliente);
-                    socket.write("226 Transfer complete.\r\n");
-                });
-            });
-        } catch (err) {
-            socket.write("550 File not found.\r\n");
-            finalizarTransferencia(estadoCliente);
-        }
-    },
-    
-    STOR: async (estadoCliente, arg) => {
-        const socket = estadoCliente.socket;
-        if (!arg) {
-            socket.write("501 Syntax error in parameters.\r\n");
-            return;
-        }
-        
-        let dataSocket;
-        try {
-            dataSocket = await obtenerDataSocket(estadoCliente);
-        } catch (err) {
-            socket.write("425 Use PASV first.\r\n");
-            return;
-        }
-        
-        const { rutaFisica } = resolverRutaSegura(estadoCliente.cwd, arg);
-        
-        try {
-            socket.write(`150 Ok to send data. Starting upload of ${arg}.\r\n`);
-            
-            const writeStream = fs.createWriteStream(rutaFisica);
-            
-            writeStream.on('error', (err) => {
-                console.error("Error escribiendo archivo en STOR:", err);
-                socket.write("552 Requested file action aborted. Error writing to disk.\r\n");
-                finalizarTransferencia(estadoCliente);
-            });
-            
-            dataSocket.on('error', (err) => {
-                console.error("Error en dataSocket durante STOR:", err);
-                writeStream.destroy();
-                finalizarTransferencia(estadoCliente);
-            });
-            
-            dataSocket.pipe(writeStream);
-            
-            dataSocket.on('end', () => {
-                writeStream.end(() => {
-                    finalizarTransferencia(estadoCliente);
-                    socket.write("226 Transfer complete.\r\n");
-                });
-            });
-        } catch (err) {
-            console.error("Error en STOR:", err);
-            socket.write("550 Cannot store file.\r\n");
-            finalizarTransferencia(estadoCliente);
-        }
-    },
-    
     DELE: async (estadoCliente, arg) => {
         const socket = estadoCliente.socket;
         if (!arg) {
@@ -434,6 +291,141 @@ const comandos = {
         socket.write("221 Goodbye.\r\n");
         socket.end();
         finalizarTransferencia(estadoCliente);
+    },
+
+    LIST: async (estadoCliente, arg) => {
+        const socket = estadoCliente.socket;
+        if (!estadoCliente.dataSocketPromise) {
+            socket.write("425 Can't open data connection. Run PASV first.\r\n");
+            return;
+        }
+
+        socket.write("150 Opening ASCII mode data connection for directory list.\r\n");
+
+        try {
+            // Esperamos a que el cliente se conecte efectivamente al puerto asignado por PASV
+            const dataSocket = await estadoCliente.dataSocketPromise;
+            const { rutaFisica } = resolverRutaSegura(estadoCliente.cwd, arg || '');
+
+            if (!fs.existsSync(rutaFisica)) {
+                socket.write("550 Directory not found.\r\n");
+                dataSocket.destroy();
+                return;
+            }
+
+            const archivos = fs.readdirSync(rutaFisica);
+            let payload = '';
+
+            for (const archivo of archivos) {
+                const stats = fs.statSync(path.join(rutaFisica, archivo));
+                const esDirectorio = stats.isDirectory() ? 'd' : '-';
+                // Formato estandarizado simplificado para la respuesta de listas (Estilo ls -l)
+                payload += `${esDirectorio}rwxr-xr-x 1 owner group ${stats.size} Jun 08 19:19 ${archivo}\r\n`;
+            }
+
+            // Enviamos los datos mapeados por el canal de datos y cerramos el canal al finalizar
+            dataSocket.write(payload, () => {
+                dataSocket.end();
+                socket.write("226 Closing data connection. Directory send OK.\r\n");
+            });
+
+        } catch (err) {
+            console.error(`[LIST ERROR]: ${err.message}`);
+            socket.write("550 Local error listing directory.\r\n");
+        } finally {
+            estadoCliente.dataSocketPromise = null;
+        }
+    },
+
+    RETR: async (estadoCliente, arg) => {
+        const socket = estadoCliente.socket;
+        if (!arg) {
+            socket.write("501 Syntax error in parameters or arguments.\r\n");
+            return;
+        }
+        if (!estadoCliente.dataSocketPromise) {
+            socket.write("425 Can't open data connection. Run PASV first.\r\n");
+            return;
+        }
+
+        const { rutaFisica } = resolverRutaSegura(estadoCliente.cwd, arg);
+
+        if (!fs.existsSync(rutaFisica) || fs.statSync(rutaFisica).isDirectory()) {
+            socket.write("550 File not found or is a directory.\r\n");
+            return;
+        }
+
+        socket.write("150 Opening BINARY mode data connection for requested file.\r\n");
+
+        try {
+            const dataSocket = await estadoCliente.dataSocketPromise;
+            // Lectura eficiente en disco por flujos (Streams) para evitar colapsar la RAM
+            const readStream = fs.createReadStream(rutaFisica);
+
+            readStream.pipe(dataSocket);
+
+            readStream.on('end', () => {
+                socket.write("226 Transfer complete.\r\n");
+            });
+
+            readStream.on('error', (err) => {
+                console.error(`[RETR STREAM ERROR]: ${err.message}`);
+                socket.write("551 Error reading file from storage.\r\n");
+                dataSocket.destroy();
+            });
+
+        } catch (err) {
+            console.error(`[RETR ERROR]: ${err.message}`);
+            socket.write("451 Local error in processing file download.\r\n");
+        } finally {
+            estadoCliente.dataSocketPromise = null;
+        }
+    },
+
+    STOR: async (estadoCliente, arg) => {
+        const socket = estadoCliente.socket;
+        if (!arg) {
+            socket.write("501 Syntax error in parameters or arguments.\r\n");
+            return;
+        }
+        if (!estadoCliente.dataSocketPromise) {
+            socket.write("425 Can't open data connection. Run PASV first.\r\n");
+            return;
+        }
+
+        socket.write("150 Ok to send data. Ready for incoming stream.\r\n");
+
+        try {
+            const dataSocket = await estadoCliente.dataSocketPromise;
+            const { rutaFisica } = resolverRutaSegura(estadoCliente.cwd, arg);
+            
+            // Escritura directa en disco conforme llegan los fragmentos binarios por la red
+            const writeStream = fs.createWriteStream(rutaFisica);
+
+            dataSocket.pipe(writeStream);
+
+            dataSocket.on('end', () => {
+                socket.write("226 Transfer complete. File written to storage successfully.\r\n");
+            });
+
+            dataSocket.on('error', (err) => {
+                console.error(`[STOR NETWORK ERROR]: ${err.message}`);
+                socket.write("426 Connection closed; transfer aborted.\r\n");
+                writeStream.destroy();
+            });
+
+            writeStream.on('error', (err) => {
+                console.error(`[STOR DISK ERROR]: ${err.message}`);
+                socket.write("552 Requested file action aborted. Disk error.\r\n");
+                dataSocket.destroy();
+            });
+
+        } catch (err) {
+            console.error(`[STOR ERROR]: ${err.message}`);
+            socket.write("451 Local error in processing file upload.\r\n");
+        } finally {
+            estadoCliente.dataSocketPromise = null;
+        }
     }
 };
 

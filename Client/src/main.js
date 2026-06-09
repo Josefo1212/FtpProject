@@ -2,19 +2,15 @@ import readline from 'node:readline';
 import path from 'node:path';
 import fs from 'node:fs';
 import { FtpClient } from './ftpClient.js';
+import { obtenerPromptDinamico, mostrarMenuAyuda, UI_COLORS } from './interface.js';
 
-// Colores ANSI para la consola
-const RED = '\x1b[31m';
-const GREEN = '\x1b[32m';
-const YELLOW = '\x1b[33m';
-const CYAN = '\x1b[36m';
-const RESET = '\x1b[0m';
-const BOLD = '\x1b[1m';
+// Extraemos los mismos nombres de variables directamente de tu archivo interface.js
+const { RED, GREEN, YELLOW, CYAN, RESET, BOLD } = UI_COLORS;
 
 const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
-    prompt: `${BOLD}${CYAN}ftp-client>${RESET} `
+    prompt: obtenerPromptDinamico() // <- Llama a la función sin parámetros para el estado desconectado
 });
 
 let cliente = null;
@@ -39,7 +35,7 @@ rl.on('line', async (line) => {
     try {
         switch (command) {
             case 'help':
-                mostrarAyuda();
+                mostrarMenuAyuda();
                 break;
                 
             case 'connect': {
@@ -71,6 +67,7 @@ rl.on('line', async (line) => {
                 const ok = await cliente.login(user, pass);
                 if (ok) {
                     console.log(`${GREEN}[OK] ¡Sesión iniciada correctamente!${RESET}`);
+                    cliente.currentCwd = await cliente.pwd();
                 } else {
                     console.error(`${RED}[ERROR] Credenciales incorrectas o rechazadas por el servidor.${RESET}`);
                 }
@@ -107,6 +104,7 @@ rl.on('line', async (line) => {
                 const ok = await cliente.cwd(pathDir);
                 if (ok) {
                     console.log(`${GREEN}[OK] Directorio cambiado correctamente.${RESET}`);
+                    cliente.currentCwd = await cliente.pwd();
                 } else {
                     console.error(`${RED}[ERROR] No se pudo cambiar de directorio.${RESET}`);
                 }
@@ -118,6 +116,7 @@ rl.on('line', async (line) => {
                 const ok = await cliente.cdup();
                 if (ok) {
                     console.log(`${GREEN}[OK] Subido un nivel en el directorio.${RESET}`);
+                    cliente.currentCwd = await cliente.pwd();
                 } else {
                     console.error(`${RED}[ERROR] No se pudo subir de nivel.${RESET}`);
                 }
@@ -277,7 +276,8 @@ rl.on('line', async (line) => {
     } catch (err) {
         console.error(`${RED}[ERROR DE CONTROL]: ${err.message}${RESET}`);
     }
-    
+
+    rl.setPrompt(obtenerPromptDinamico(cliente?.host, cliente?.currentCwd));
     rl.prompt();
 });
 
@@ -289,21 +289,3 @@ function asegurarConectado() {
     return true;
 }
 
-function mostrarAyuda() {
-    console.log(`\n${BOLD}${CYAN}Comandos Disponibles:${RESET}`);
-    console.log(`  ${BOLD}${YELLOW}connect [host] [port]${RESET} : Conecta al servidor FTP (por defecto localhost:3000)`);
-    console.log(`  ${BOLD}${YELLOW}login <user> <pass>${RESET}    : Inicia sesión (Laura: user=laura pass=12345)`);
-    console.log(`  ${BOLD}${YELLOW}pwd${RESET}                  : Imprime el directorio actual en el servidor`);
-    console.log(`  ${BOLD}${YELLOW}cd <path>${RESET}             : Cambia de directorio en el servidor`);
-    console.log(`  ${BOLD}${YELLOW}cdup${RESET}                 : Sube un nivel de directorio`);
-    console.log(`  ${BOLD}${YELLOW}ls [path]${RESET}            : Muestra los archivos del directorio actual/indicado`);
-    console.log(`  ${BOLD}${YELLOW}get <remote> [local]${RESET} : Descarga un archivo del servidor`);
-    console.log(`  ${BOLD}${YELLOW}put <local> [remote]${RESET} : Sube un archivo al servidor`);
-    console.log(`  ${BOLD}${YELLOW}delete <file>${RESET}        : Elimina un archivo del servidor`);
-    console.log(`  ${BOLD}${YELLOW}mkdir <dir>${RESET}          : Crea un directorio en el servidor`);
-    console.log(`  ${BOLD}${YELLOW}rmdir <dir>${RESET}          : Elimina un directorio del servidor`);
-    console.log(`  ${BOLD}${YELLOW}type <A|I>${RESET}            : Cambia el modo de transferencia (ASCII / Binario)`);
-    console.log(`  ${BOLD}${YELLOW}raw <comando>${RESET}         : Envía un comando de FTP crudo directamente`);
-    console.log(`  ${BOLD}${YELLOW}quit / exit / bye${RESET}    : Desconecta y cierra el cliente`);
-    console.log(`  ${BOLD}${YELLOW}help${RESET}                 : Muestra este panel de ayuda\n`);
-}

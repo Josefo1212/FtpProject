@@ -8,29 +8,17 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const STORAGE_ROOT = path.resolve(__dirname, '../storage');
 
-// Asegurarse de que exista el directorio de almacenamiento raíz
 if (!fs.existsSync(STORAGE_ROOT)) {
     fs.mkdirSync(STORAGE_ROOT, { recursive: true });
 }
 
-/**
- * Resuelve una ruta FTP en su correspondiente ruta FTP normalizada y en la ruta física real
- * dentro de la carpeta 'storage' del servidor. Previene vulnerabilidades de Directory Traversal (chroot).
- * 
- * @param {string} cwd - Directorio de trabajo actual del cliente en formato FTP (ej: '/').
- * @param {string} rutaSolicitada - Ruta provista por el comando del cliente.
- * @returns {{ rutaFTP: string, rutaFisica: string }}
- */
-export function resolverRutaSegura(cwd, rutaSolicitada) {
-    // Dividimos por barras / o \
+function resolverRutaSegura(cwd, rutaSolicitada) {
     const parts = (rutaSolicitada.startsWith('/') ? rutaSolicitada : path.join(cwd, rutaSolicitada))
         .split(/[/\\]/);
     
     const stack = [];
     for (const part of parts) {
-        if (part === '' || part === '.') {
-            continue;
-        }
+        if (part === '' || part === '.') continue;
         if (part === '..') {
             stack.pop();
         } else {
@@ -38,67 +26,16 @@ export function resolverRutaSegura(cwd, rutaSolicitada) {
         }
     }
     
-    const rutaFTP = '/' + stack.join('/');
-    const rutaFisica = path.resolve(STORAGE_ROOT, ...stack);
-    
-    return {
-        rutaFTP,
-        rutaFisica
-    };
+    return path.resolve(STORAGE_ROOT, ...stack);
 }
 
-// Catálogo de usuarios válidos para pruebas académicas
 const USUARIOS_VALIDOS = {
-    'laura': '12345',
+    'laura': 'laura123',
     'josefo': 'josefo1212',
-    'anonymous': ''
+    'luismi': 'luismi123'
 };
 
-// Formateador de listados estilo Unix 'ls -l'
-const MESES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-function formatearFicheroLista(nombre, stats) {
-    const esDir = stats.isDirectory();
-    const permisos = esDir ? "drwxr-xr-x" : "-rw-r--r--";
-    const enlaces = "1";
-    const usuario = "ftpuser";
-    const grupo = "ftpgroup";
-    const tamano = stats.size.toString().padStart(8, ' ');
-    
-    const mtime = stats.mtime;
-    const mes = MESES[mtime.getMonth()];
-    const dia = mtime.getDate().toString().padStart(2, ' ');
-    const hora = mtime.getHours().toString().padStart(2, '0');
-    const min = mtime.getMinutes().toString().padStart(2, '0');
-    const fechaStr = `${mes} ${dia} ${hora}:${min}`;
-    
-    return `${permisos} ${enlaces.padStart(3, ' ')} ${usuario.padEnd(8, ' ')} ${grupo.padEnd(8, ' ')} ${tamano} ${fechaStr} ${nombre}`;
-}
-
-// Helpers para obtención y liberación del canal de datos pasivo
-async function obtenerDataSocket(estadoCliente) {
-    if (estadoCliente.dataSocket) {
-        return estadoCliente.dataSocket;
-    }
-    if (!estadoCliente.dataSocketPromise) {
-        throw new Error("NO_PASSIVE");
-    }
-    
-    // Esperar conexión física con un timeout de 10 segundos
-    const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error("TIMEOUT")), 10000);
-    });
-    
-    const dataSocket = await Promise.race([
-        estadoCliente.dataSocketPromise,
-        timeoutPromise
-    ]);
-    
-    estadoCliente.dataSocket = dataSocket;
-    estadoCliente.dataSocketPromise = null; // Consumida
-    return dataSocket;
-}
-
-function finalizarTransferencia(estadoCliente) {
+const finalizarTransferencia = (estadoCliente) => {
     if (estadoCliente.dataSocket) {
         estadoCliente.dataSocket.destroy();
         estadoCliente.dataSocket = null;
@@ -107,9 +44,8 @@ function finalizarTransferencia(estadoCliente) {
         estadoCliente.dataServer.close();
         estadoCliente.dataServer = null;
     }
-}
+};
 
-// Diccionario de Handlers de comandos FTP
 const comandos = {
     USER: async (estadoCliente, arg) => {
         const socket = estadoCliente.socket;
@@ -140,69 +76,15 @@ const comandos = {
         const user = estadoCliente.username.toLowerCase();
         const expectedPass = USUARIOS_VALIDOS[user];
         
-        if (expectedPass !== undefined && (user === 'anonymous' || expectedPass === arg)) {
+        if (expectedPass !== undefined && expectedPass === arg) {
             estadoCliente.isAuthenticated = true;
             estadoCliente.state = 'LOGGED_IN';
             estadoCliente.cwd = '/';
-            estadoCliente.representationType = 'I';
             socket.write("230 User logged in, proceed.\r\n");
         } else {
             estadoCliente.state = 'NOT_LOGGED_IN';
             estadoCliente.username = null;
             socket.write("530 Login incorrect.\r\n");
-        }
-    },
-    
-    SYST: async (estadoCliente) => {
-        estadoCliente.socket.write("215 UNIX Type: L8\r\n");
-    },
-    
-    FEAT: async (estadoCliente) => {
-        estadoCliente.socket.write("211-Features:\r\n UTF8\r\n211 End\r\n");
-    },
-    
-    NOOP: async (estadoCliente) => {
-        estadoCliente.socket.write("200 NOOP ok.\r\n");
-    },
-    
-    PWD: async (estadoCliente) => {
-        estadoCliente.socket.write(`257 "${estadoCliente.cwd}" is current directory.\r\n`);
-    },
-    
-    CWD: async (estadoCliente, arg) => {
-        const socket = estadoCliente.socket;
-        if (!arg) {
-            socket.write("501 Syntax error in parameters.\r\n");
-            return;
-        }
-        
-        const { rutaFTP, rutaFisica } = resolverRutaSegura(estadoCliente.cwd, arg);
-        
-        try {
-            const stats = await fs.promises.stat(rutaFisica);
-            if (stats.isDirectory()) {
-                estadoCliente.cwd = rutaFTP;
-                socket.write(`250 Directory successfully changed to "${rutaFTP}".\r\n`);
-            } else {
-                socket.write("550 Not a directory.\r\n");
-            }
-        } catch (err) {
-            socket.write("550 Directory not found.\r\n");
-        }
-    },
-    
-    CDUP: async (estadoCliente) => {
-        await comandos.CWD(estadoCliente, '..');
-    },
-    
-    TYPE: async (estadoCliente, arg) => {
-        const socket = estadoCliente.socket;
-        const type = arg.toUpperCase();
-        if (type === 'A' || type === 'I') {
-            estadoCliente.representationType = type;
-            socket.write(`200 Type set to ${type}.\r\n`);
-        } else {
-            socket.write("504 Command not implemented for that parameter.\r\n");
         }
     },
     
@@ -224,74 +106,6 @@ const comandos = {
             socket.write("425 Can't open data connection.\r\n");
         }
     },
-    
-    DELE: async (estadoCliente, arg) => {
-        const socket = estadoCliente.socket;
-        if (!arg) {
-            socket.write("501 Syntax error in parameters.\r\n");
-            return;
-        }
-        
-        const { rutaFisica } = resolverRutaSegura(estadoCliente.cwd, arg);
-        
-        try {
-            const stats = await fs.promises.stat(rutaFisica);
-            if (stats.isDirectory()) {
-                socket.write("550 Cannot delete directory. Use RMD.\r\n");
-                return;
-            }
-            await fs.promises.unlink(rutaFisica);
-            socket.write("250 File deleted successfully.\r\n");
-        } catch (err) {
-            socket.write("550 File not found.\r\n");
-        }
-    },
-    
-    MKD: async (estadoCliente, arg) => {
-        const socket = estadoCliente.socket;
-        if (!arg) {
-            socket.write("501 Syntax error in parameters.\r\n");
-            return;
-        }
-        const { rutaFTP, rutaFisica } = resolverRutaSegura(estadoCliente.cwd, arg);
-        try {
-            await fs.promises.mkdir(rutaFisica);
-            socket.write(`257 "${rutaFTP}" created.\r\n`);
-        } catch (err) {
-            socket.write("550 Directory could not be created.\r\n");
-        }
-    },
-    
-    RMD: async (estadoCliente, arg) => {
-        const socket = estadoCliente.socket;
-        if (!arg) {
-            socket.write("501 Syntax error in parameters.\r\n");
-            return;
-        }
-        const { rutaFisica } = resolverRutaSegura(estadoCliente.cwd, arg);
-        try {
-            const stats = await fs.promises.stat(rutaFisica);
-            if (!stats.isDirectory()) {
-                socket.write("550 Not a directory.\r\n");
-                return;
-            }
-            await fs.promises.rmdir(rutaFisica);
-            socket.write("250 Directory removed successfully.\r\n");
-        } catch (err) {
-            socket.write("550 Directory not found or not empty.\r\n");
-        }
-    },
-    
-    QUIT: async (estadoCliente) => {
-        await comandos.QUIT_INTERNAL(estadoCliente);
-    },
-    
-    QUIT_INTERNAL: async (estadoCliente) => {
-        const socket = estadoCliente.socket;
-        socket.write("221 Goodbye.\r\n");
-        socket.end();
-        finalizarTransferencia(estadoCliente);
-    },
 
     LIST: async (estadoCliente, arg) => {
         const socket = estadoCliente.socket;
@@ -305,7 +119,7 @@ const comandos = {
         try {
             // Esperamos a que el cliente se conecte efectivamente al puerto asignado por PASV
             const dataSocket = await estadoCliente.dataSocketPromise;
-            const { rutaFisica } = resolverRutaSegura(estadoCliente.cwd, arg || '');
+            const rutaFisica = resolverRutaSegura(estadoCliente.cwd, arg || '');
 
             if (!fs.existsSync(rutaFisica)) {
                 socket.write("550 Directory not found.\r\n");
@@ -320,7 +134,14 @@ const comandos = {
                 const stats = fs.statSync(path.join(rutaFisica, archivo));
                 const esDirectorio = stats.isDirectory() ? 'd' : '-';
                 // Formato estandarizado simplificado para la respuesta de listas (Estilo ls -l)
-                payload += `${esDirectorio}rwxr-xr-x 1 owner group ${stats.size} Jun 08 19:19 ${archivo}\r\n`;
+                const tamano = stats.size.toString().padStart(8, ' ');
+                const mtime = stats.mtime;
+                const meses = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+                const mes = meses[mtime.getMonth()];
+                const dia = mtime.getDate().toString().padStart(2, ' ');
+                const hora = mtime.getHours().toString().padStart(2, '0');
+                const min = mtime.getMinutes().toString().padStart(2, '0');
+                payload += `${esDirectorio}rwxr-xr-x 1 ftpuser ftpgroup ${tamano} ${mes} ${dia} ${hora}:${min} ${archivo}\r\n`;
             }
 
             // Enviamos los datos mapeados por el canal de datos y cerramos el canal al finalizar
@@ -348,7 +169,7 @@ const comandos = {
             return;
         }
 
-        const { rutaFisica } = resolverRutaSegura(estadoCliente.cwd, arg);
+        const rutaFisica = resolverRutaSegura(estadoCliente.cwd, arg);
 
         if (!fs.existsSync(rutaFisica) || fs.statSync(rutaFisica).isDirectory()) {
             socket.write("550 File not found or is a directory.\r\n");
@@ -381,68 +202,22 @@ const comandos = {
             estadoCliente.dataSocketPromise = null;
         }
     },
-
-    STOR: async (estadoCliente, arg) => {
+    
+    QUIT: async (estadoCliente) => {
         const socket = estadoCliente.socket;
-        if (!arg) {
-            socket.write("501 Syntax error in parameters or arguments.\r\n");
-            return;
-        }
-        if (!estadoCliente.dataSocketPromise) {
-            socket.write("425 Can't open data connection. Run PASV first.\r\n");
-            return;
-        }
-
-        socket.write("150 Ok to send data. Ready for incoming stream.\r\n");
-
-        try {
-            const dataSocket = await estadoCliente.dataSocketPromise;
-            const { rutaFisica } = resolverRutaSegura(estadoCliente.cwd, arg);
-            
-            // Escritura directa en disco conforme llegan los fragmentos binarios por la red
-            const writeStream = fs.createWriteStream(rutaFisica);
-
-            dataSocket.pipe(writeStream);
-
-            dataSocket.on('end', () => {
-                socket.write("226 Transfer complete. File written to storage successfully.\r\n");
-            });
-
-            dataSocket.on('error', (err) => {
-                console.error(`[STOR NETWORK ERROR]: ${err.message}`);
-                socket.write("426 Connection closed; transfer aborted.\r\n");
-                writeStream.destroy();
-            });
-
-            writeStream.on('error', (err) => {
-                console.error(`[STOR DISK ERROR]: ${err.message}`);
-                socket.write("552 Requested file action aborted. Disk error.\r\n");
-                dataSocket.destroy();
-            });
-
-        } catch (err) {
-            console.error(`[STOR ERROR]: ${err.message}`);
-            socket.write("451 Local error in processing file upload.\r\n");
-        } finally {
-            estadoCliente.dataSocketPromise = null;
-        }
+        socket.write("221 Goodbye.\r\n");
+        socket.end();
+        finalizarTransferencia(estadoCliente);
     }
 };
-
-/**
- * Despacha un comando FTP recibido del cliente, validando previamente el estado de autenticación.
- * 
- * @param {object} estadoCliente - Estado asociado a la conexión del cliente.
- * @param {string} cmd - Comando FTP en mayúsculas (ej: 'USER').
- * @param {string} arg - Argumento del comando (ej: 'laura').
- */
-export async function ejecutarComandoFTP(estadoCliente, cmd, arg) {
+    
+export const ejecutarComandoFTP = async (estadoCliente, cmd, arg) => {
     const socket = estadoCliente.socket;
     
     // Verificar si el comando requiere autenticación previa
-    const requiereAuth = !['USER', 'PASS', 'QUIT', 'SYST', 'FEAT', 'NOOP'].includes(cmd);
+    const sinAuth = ['USER', 'PASS', 'QUIT'];
     
-    if (requiereAuth && !estadoCliente.isAuthenticated) {
+    if (!sinAuth.includes(cmd) && !estadoCliente.isAuthenticated) {
         socket.write("530 Please login with USER and PASS.\r\n");
         return;
     }
@@ -458,4 +233,4 @@ export async function ejecutarComandoFTP(estadoCliente, cmd, arg) {
     } else {
         socket.write("502 Command not implemented.\r\n");
     }
-}
+};

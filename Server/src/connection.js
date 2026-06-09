@@ -4,12 +4,6 @@ import { ejecutarComandoFTP } from './commands.js';
 
 const clientesConectados = new Map();
 
-/**
- * Gestiona una nueva conexión en el canal de control.
- * Implementa line-buffering para evitar problemas de fragmentación de red (TCP segment split).
- * 
- * @param {import('node:net').Socket} socket - El socket del canal de control.
- */
 export const manejarNuevaConexion = (socket) => {
     const clientId = crypto.randomUUID();
     console.log(`[CONEXIÓN] Nuevo cliente conectado (ID: ${clientId}) desde ${socket.remoteAddress}:${socket.remotePort}`);
@@ -22,7 +16,6 @@ export const manejarNuevaConexion = (socket) => {
         state: 'NOT_LOGGED_IN',
         username: null,
         cwd: '/',
-        representationType: 'I', // Por defecto Binario ('I')
         dataServer: null,
         dataSocketPromise: null,
         dataSocket: null
@@ -75,11 +68,6 @@ export const manejarNuevaConexion = (socket) => {
     });
 };
 
-/**
- * Libera y destruye los puertos y sockets asociados al cliente al desconectarse.
- * 
- * @param {string} clientId - ID único de la conexión.
- */
 const limpiarRecursosCliente = (clientId) => {
     const cliente = clientesConectados.get(clientId);
     if (cliente) {

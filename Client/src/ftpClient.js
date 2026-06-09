@@ -8,7 +8,7 @@ export class FtpClient {
         this.host = host;
         this.port = port;
         this.controlSocket = null;
-        this.pendingRequests = []; // Cola FIFO para comandos TCP
+        this.pendingRequests = [];
         this.currentResponseLines = [];
         this.connectResolver = null;
         this.connectRejecter = null;

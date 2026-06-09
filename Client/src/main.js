@@ -10,7 +10,6 @@ const PORT = 21;
 const DOWNLOADS_DIR = path.resolve('./downloads');
 const UPLOADS_DIR = path.resolve('./uploads');
 
-// Crear directorios de forma compacta
 [DOWNLOADS_DIR, UPLOADS_DIR].forEach(dir => fs.mkdirSync(dir, { recursive: true }));
 
 const rl = readline.createInterface({

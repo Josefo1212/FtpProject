@@ -6,21 +6,22 @@ import { conectarCanalDatos } from './dataHandler.js';
 
 export class FtpClient {
 
-    constructor(host = '127.0.0.1', port = 3000) {
+    constructor(host = '127.0.0.1', port = 21) {
         this.host = host;
         this.port = port;
         this.controlSocket = null;
-        
-        // Cola para sincronizar comandos síncronos sobre canal asíncrono TCP
+
+        // Cola FIFO para sincronizar comandos sobre canal asíncrono TCP
         this.pendingRequests = [];
         this.currentResponseLines = [];
-        
+
         this.connectResolver = null;
         this.connectRejecter = null;
-        
+
         // Estado de autenticación visible para el prompt dinámico
         this.isAuthenticated = false;
     }
+
 
     conectar() {
         return new Promise((resolve, reject) => {
@@ -37,7 +38,7 @@ export class FtpClient {
             this.controlSocket.on('data', (chunk) => {
                 buffer += chunk;
                 let newlineIndex;
-                
+
                 // Procesar línea por línea
                 while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
                     const line = buffer.substring(0, newlineIndex);
@@ -72,7 +73,7 @@ export class FtpClient {
             const cleanCmd = comando.trim();
             // Encolamos el resolver para responder de forma ordenada (FIFO)
             this.pendingRequests.push({ resolve, reject, command: cleanCmd });
-            
+
             // Envío en formato estándar de protocolo de internet FTP (\r\n)
             this.controlSocket.write(`${cleanCmd}\r\n`);
         });
@@ -92,13 +93,13 @@ export class FtpClient {
             if (parsed.code === startCode && parsed.separator === ' ') {
                 const combinedMessage = this.currentResponseLines.map(r => r.message).join('\n');
                 const combinedRaw = this.currentResponseLines.map(r => r.raw).join('\n');
-                
+
                 const finalResponse = {
                     code: startCode,
                     message: combinedMessage,
                     raw: combinedRaw
                 };
-                
+
                 this.currentResponseLines = [];
                 this._despacharRespuesta(finalResponse);
             }
@@ -114,7 +115,7 @@ export class FtpClient {
     }
 
     _despacharRespuesta(response) {
-        // Caso especial: El mensaje 220 inicial (Handshake de conexión)
+        // ─── Caso especial: Mensaje 220 de bienvenida (Handshake) ───
         if (this.connectResolver && response.code === 220) {
             this.connectResolver(response);
             this.connectResolver = null;
@@ -122,7 +123,15 @@ export class FtpClient {
             return;
         }
 
-        // Obtener la promesa más antigua en espera
+        // ─── RFC 959: Respuestas preliminares 1xx ───
+        if (response.code >= 100 && response.code < 200) {
+            if (this.pendingRequests.length > 0) {
+                this.pendingRequests[0].preliminary = response;
+            }
+            return;
+        }
+
+        // ─── Respuesta final: desencolamos y resolvemos ───
         if (this.pendingRequests.length > 0) {
             const req = this.pendingRequests.shift();
             req.resolve(response);
@@ -142,12 +151,15 @@ export class FtpClient {
             const resPass = await this.enviarComando(`PASS ${pass}`);
             if (resPass.code === 230) {
                 this.isAuthenticated = true;
+                // Establecer modo binario para transferencias fiables (imágenes, PDFs, etc.)
+                await this.enviarComando('TYPE I');
                 return true;
             }
             return false;
         }
         if (resUser.code === 230) {
             this.isAuthenticated = true;
+            await this.enviarComando('TYPE I');
             return true;
         }
         return false;
@@ -161,32 +173,34 @@ export class FtpClient {
         throw new Error(`Error en PASV: ${res.code} ${res.message}`);
     }
 
+
     async list() {
         const { host, port } = await this.pasv();
-        const dataSocketPromise = conectarCanalDatos(host, port);
-        const listCmdPromise = this.enviarComando('LIST');
-        
-        const dataSocket = await dataSocketPromise;
-        
+        const dataSocket = await conectarCanalDatos(host, port);
+
+        // Enviar LIST: FileZilla responde 150 (ignorado por dispatcher) luego 226
+        const listPromise = this.enviarComando('LIST');
+
         return new Promise((resolve, reject) => {
             let dataBuffer = '';
             dataSocket.setEncoding('utf-8');
-            
+
             dataSocket.on('data', (chunk) => {
                 dataBuffer += chunk;
             });
-            
+
             dataSocket.on('error', (err) => {
                 reject(err);
             });
-            
+
             dataSocket.on('close', async () => {
                 try {
-                    const controlRes = await listCmdPromise;
-                    if (controlRes.code === 226 || controlRes.code === 250 || controlRes.code === 150) {
+                    // Esperar la respuesta final 226 "Transfer complete"
+                    const res = await listPromise;
+                    if (res.code === 226 || res.code === 250) {
                         resolve(dataBuffer);
                     } else {
-                        reject(new Error(`Fallo en el listado de archivos: ${controlRes.code}`));
+                        reject(new Error(`Error en listado de archivos: ${res.code} ${res.message}`));
                     }
                 } catch (err) {
                     reject(err);
@@ -194,6 +208,7 @@ export class FtpClient {
             });
         });
     }
+
 
     async download(remoteFile, localPath) {
         // Asegurar la carpeta de destino
@@ -203,32 +218,34 @@ export class FtpClient {
         }
 
         const { host, port } = await this.pasv();
-        const dataSocketPromise = conectarCanalDatos(host, port);
-        const retrCmdPromise = this.enviarComando(`RETR ${remoteFile}`);
-        
-        const dataSocket = await dataSocketPromise;
-        
+        const dataSocket = await conectarCanalDatos(host, port);
+
+        // Enviar RETR: FileZilla responde 150 (ignorado) luego 226
+        const retrPromise = this.enviarComando(`RETR ${remoteFile}`);
+
         return new Promise((resolve, reject) => {
             const writeStream = fs.createWriteStream(localPath);
-            
+
             writeStream.on('error', (err) => {
+                dataSocket.destroy();
                 reject(err);
             });
-            
+
             dataSocket.on('error', (err) => {
                 writeStream.destroy();
                 reject(err);
             });
-            
+
+            // Transferencia directa: socket de datos → archivo local
             dataSocket.pipe(writeStream);
-            
+
             dataSocket.on('close', async () => {
                 try {
-                    const controlRes = await retrCmdPromise;
-                    if (controlRes.code === 226 || controlRes.code === 250 || controlRes.code === 150) {
+                    const res = await retrPromise;
+                    if (res.code === 226 || res.code === 250) {
                         resolve(true);
                     } else {
-                        reject(new Error(`Fallo al descargar archivo: ${controlRes.code}`));
+                        reject(new Error(`Error al descargar archivo: ${res.code} ${res.message}`));
                     }
                 } catch (err) {
                     reject(err);
@@ -237,11 +254,68 @@ export class FtpClient {
         });
     }
 
+    async upload(remoteFile, localPath) {
+        if (!fs.existsSync(localPath)) {
+            throw new Error(`Archivo local no encontrado: ${localPath}`);
+        }
+
+        const { host, port } = await this.pasv();
+        const dataSocket = await conectarCanalDatos(host, port);
+
+        // Enviar STOR: FileZilla responde 150 (ignorado) luego 226
+        const storPromise = this.enviarComando(`STOR ${remoteFile}`);
+
+        return new Promise((resolve, reject) => {
+            const readStream = fs.createReadStream(localPath);
+
+            readStream.on('error', (err) => {
+                dataSocket.destroy();
+                reject(err);
+            });
+
+            dataSocket.on('error', (err) => {
+                readStream.destroy();
+                reject(err);
+            });
+
+
+            readStream.pipe(dataSocket);
+
+            dataSocket.on('close', async () => {
+                try {
+                    const res = await storPromise;
+                    if (res.code === 226 || res.code === 250) {
+                        resolve(true);
+                    } else {
+                        reject(new Error(`Error al subir archivo: ${res.code} ${res.message}`));
+                    }
+                } catch (err) {
+                    reject(err);
+                }
+            });
+        });
+    }
+
+    async deleteFile(remoteFile) {
+        const res = await this.enviarComando(`DELE ${remoteFile}`);
+        if (res.code === 250) {
+            return true;
+        }
+        throw new Error(`Error al borrar archivo: ${res.code} ${res.message}`);
+    }
+
+    async makeDirectory(dirName) {
+        const res = await this.enviarComando(`MKD ${dirName}`);
+        if (res.code === 257) {
+            return res.message;
+        }
+        throw new Error(`Error al crear directorio: ${res.code} ${res.message}`);
+    }
+
     async quit() {
         try {
             await this.enviarComando("QUIT");
         } catch (e) {
-            // Ignorar errores si el servidor ya cerró la conexión
         } finally {
             if (this.controlSocket) {
                 this.controlSocket.destroy();

@@ -1,17 +1,14 @@
 import net from 'node:net';
 
-export const conectarCanalDatos = (host, puerto) => {
+export const conectarCanalDatos = (host, port) => {
     return new Promise((resolve, reject) => {
-        console.log(`[DATA] Conectando al canal de datos en ${host}:${puerto}...`);
+        console.log(`[DATA] Conectando al canal de datos en ${host}:${port}...`);
         
-        const dataSocket = net.createConnection({ host, port: puerto }, () => {
+        const dataSocket = net.createConnection({ host, port }, () => {
             console.log(`[DATA] ¡Conexión de datos establecida con éxito!`);
-            resolve(dataSocket); // Le entregamos el socket al Integrante 3 para que descargue/suba los bytes
+            resolve(dataSocket);
         });
 
-        dataSocket.on('error', (err) => {
-            console.error(`[DATA ERROR] Error en el canal de datos: ${err.message}`);
-            reject(err);
-        });
+        dataSocket.once('error', reject);
     });
-}
+};

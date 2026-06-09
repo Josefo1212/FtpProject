@@ -1,10 +1,9 @@
 export const parseFTPResponse = (line) => {
-    const cleanLine = line.replace(/\r$/, '');
-    const codeStr = cleanLine.substring(0, 3);
-    const code = parseInt(codeStr, 10);
+    const cleanLine = line.trimEnd();
+    const code = parseInt(cleanLine.substring(0, 3), 10);
     
-    const separator = cleanLine.length > 3 ? cleanLine.charAt(3) : ' ';
-    const message = cleanLine.length > 4 ? cleanLine.substring(4) : '';
+    const separator = cleanLine[3] ?? ' ';
+    const message = cleanLine.substring(4);
     
     return {
         code: isNaN(code) ? 0 : code,
@@ -12,16 +11,17 @@ export const parseFTPResponse = (line) => {
         message,
         raw: line
     };
-}
+};
 
 export const parsePASVResponse = (message) => {
     const match = message.match(/\((\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\)/);
-    if (!match) {
-        throw new Error(`Respuesta PASV con formato inválido: "${message}"`);
-    }
     
-    const host = `${match[1]}.${match[2]}.${match[3]}.${match[4]}`;
-    const port = parseInt(match[5], 10) * 256 + parseInt(match[6], 10);
+    if (!match) throw new Error(`Respuesta PASV con formato inválido: "${message}"`);
     
-    return { host, port };
-}
+    const [_, p1, p2, p3, p4, p5, p6] = match;
+    
+    return { 
+        host: `${p1}.${p2}.${p3}.${p4}`, 
+        port: (parseInt(p5, 10) * 256) + parseInt(p6, 10) 
+    };
+};
